@@ -27,6 +27,7 @@ class TransformerModelArgs(BaseModelArgs):
     vocab_size: int = -1  # defined later by tokenizer
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
+    ffn_dim: Optional[int] = None
     norm_eps: float = 1e-5
     rope_theta: float = 10000
 
@@ -36,8 +37,17 @@ class TransformerModelArgs(BaseModelArgs):
     depth_init: bool = True
     norm_type: str = "rmsnorm"
 
+    # NOTE: torchtitan default is true. However, llama pretrained weights use
+    # interleaved=False.
+    rope_interleaved: bool = False
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    # NOTE: newer models seems to have tie_word_embeddings=True
+    tie_word_embeddings: bool = False
+
+
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float = 10000.0, return_cos_sin: bool = False
+) -> torch.Tensor:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
@@ -56,7 +66,11 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    if return_cos_sin:
+        cos, sin = torch.cos(freqs), torch.sin(freqs)
+        freqs_cis = torch.stack([cos, sin], dim=0)
+    else:
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
 
@@ -90,6 +104,7 @@ def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
+    interleaved: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to input tensors using the given frequency tensor.
@@ -99,6 +114,9 @@ def apply_rotary_emb(
     is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
     returned as real tensors.
 
+    Note that original LlamaForCausalLM uses interleaved=False, but torchtitan by default
+    uses interleaved=True!! I'm reverting to interleaved=False for now.
+
     Args:
         xq (torch.Tensor): Query tensor to apply rotary embeddings.
         xk (torch.Tensor): Key tensor to apply rotary embeddings.
@@ -107,12 +125,30 @@ def apply_rotary_emb(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
     """
+    if not interleaved:
+        seqlen = xq.shape[1]
+        cos, sin = freqs_cis[0].repeat(1, 2), freqs_cis[1].repeat(1, 2)
+        cos, sin = cos.float(), sin.float()
+        cos, sin = cos[:seqlen], sin[:seqlen]
+        xk_out = apply_rope(xk.transpose(1, 2).float(), cos, sin).transpose(1, 2)
+        xq_out = apply_rope(xq.transpose(1, 2).float(), cos, sin).transpose(1, 2)
+        return xq_out.type_as(xq), xk_out.type_as(xk)
+
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    head_size = x.size(-1)
+    x1 = x[..., : head_size // 2]  # (B, nh, T, hs/2)
+    x2 = x[..., head_size // 2 :]  # (B, nh, T, hs/2)
+    rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
+    roped = (x * cos) + (rotated * sin)
+    return roped.type_as(x)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -166,6 +202,8 @@ class Attention(nn.Module):
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
 
+        self.rope_interleaved = model_args.rope_interleaved
+
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
@@ -197,7 +235,9 @@ class Attention(nn.Module):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(
+            xq, xk, freqs_cis=freqs_cis, interleaved=self.rope_interleaved
+        )
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -225,6 +265,7 @@ class FeedForward(nn.Module):
         hidden_dim (int): Hidden dimension of the feedforward layer.
         multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
         ffn_dim_multiplier (Optional[float]): Custom multiplier for hidden dimension. Defaults to None.
+        ffn_dim (Optional[int]): Custom hidden dimension. Defaults to None.
 
     Attributes:
         w1 (Linear): Linear transformation for the first layer.
@@ -239,11 +280,15 @@ class FeedForward(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
+        ffn_dim: Optional[int],
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
+        # custom ffn_dim
+        if ffn_dim is not None:
+            hidden_dim = ffn_dim
         # custom dim factor multiplier
-        if ffn_dim_multiplier is not None:
+        elif ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
@@ -290,6 +335,7 @@ class TransformerBlock(nn.Module):
             hidden_dim=4 * model_args.dim,
             multiple_of=model_args.multiple_of,
             ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+            ffn_dim=model_args.ffn_dim,
         )
         self.layer_id = layer_id
         self.num_layers = model_args.n_layers
@@ -380,6 +426,9 @@ class Transformer(nn.Module, ModelProtocol):
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
 
+        if model_args.tie_word_embeddings:
+            self.output.weight = self.tok_embeddings.weight
+
     def init_weights(
         self,
         buffer_device: Optional[torch.device] = None,
@@ -407,7 +456,7 @@ class Transformer(nn.Module, ModelProtocol):
             self.norm.reset_parameters()
         final_out_std = self.model_args.dim**-0.5
         cutoff_factor = 3
-        if self.output is not None:
+        if self.output is not None and not self.model_args.tie_word_embeddings:
             nn.init.trunc_normal_(
                 self.output.weight,
                 mean=0.0,
@@ -424,6 +473,7 @@ class Transformer(nn.Module, ModelProtocol):
             # relaxing in our CP enablement PR
             self.model_args.max_seq_len,
             self.model_args.rope_theta,
+            return_cos_sin=(not self.model_args.rope_interleaved),
         )
 
     def forward(self, tokens: torch.Tensor):
